@@ -1,0 +1,9 @@
+streamlit==1.37.1
+streamlit-autocomplete==0.1.0
+pandas==2.3.3
+numpy==2.5.4
+plotly==7.1.0
+geopandas==1.2.0
+pyarrow==26.0.1
+matplotlib==3.11.2
+scipy==1.18.1
