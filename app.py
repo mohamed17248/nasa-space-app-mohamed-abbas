@@ -12,6 +12,7 @@ import streamlit as st
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.dates
 import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Egypt Fire Hotspots", layout="wide")
@@ -118,17 +119,18 @@ else:
 
 st.subheader("Monthly detections over time")
 monthly = df.groupby(["month", "sensor"]).size().unstack(fill_value=0)
-monthly.index = pd.PeriodIndex(monthly.index, freq="M")
+monthly.index = pd.PeriodIndex(monthly.index, freq="M").to_timestamp()
 fig, ax = plt.subplots(figsize=(12, 3.5))
 if "MODIS" in monthly:
-    ax.plot(monthly.index.astype(str), monthly["MODIS"], color="tab:orange",
+    ax.plot(monthly.index, monthly["MODIS"], color="tab:orange",
             marker=".", markersize=3, label="MODIS (≤2011)")
 if "VIIRS" in monthly:
-    ax.plot(monthly.index.astype(str), monthly["VIIRS"], color="tab:blue",
+    ax.plot(monthly.index, monthly["VIIRS"], color="tab:blue",
             marker=".", markersize=3, label="VIIRS (≥2012)")
 ax.set_ylabel("detections / month")
 ax.legend()
-ax.tick_params(axis="x", rotation=90, labelsize=7)
+ax.xaxis.set_major_locator(matplotlib.dates.YearLocator())
+ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%Y"))
 fig.tight_layout()
 st.pyplot(fig)
 plt.close(fig)

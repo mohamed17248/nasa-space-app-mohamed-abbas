@@ -12,6 +12,7 @@ import pandas as pd
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.dates
 import matplotlib.pyplot as plt
 
 # ------------------------------------------------------------------ load --
@@ -89,21 +90,23 @@ monthly = (
     full.groupby(["month", "sensor"]).size().unstack(fill_value=0)
     .reindex(columns=["MODIS", "VIIRS"], fill_value=0)
 )
-monthly.index = pd.PeriodIndex(monthly.index, freq="M")
+monthly.index = pd.PeriodIndex(monthly.index, freq="M").to_timestamp()
 
 fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
-axes[0].bar(monthly.index.astype(str), monthly["MODIS"], width=25,
+axes[0].bar(monthly.index, monthly["MODIS"], width=25,
             color="tab:orange", label="MODIS (Terra+Aqua)")
 axes[0].set_ylabel("detections / month")
 axes[0].set_title("MODIS monthly fire hotspots, Egypt 2000–2025")
 axes[0].legend()
 
-axes[1].bar(monthly.index.astype(str), monthly["VIIRS"], width=25,
+axes[1].bar(monthly.index, monthly["VIIRS"], width=25,
             color="tab:blue", label="VIIRS (Suomi-NPP)")
 axes[1].set_ylabel("detections / month")
 axes[1].set_title("VIIRS monthly fire hotspots, Egypt 2012–2025")
 axes[1].legend()
-axes[1].tick_params(axis="x", rotation=90, labelsize=7)
+for ax in axes:
+    ax.xaxis.set_major_locator(matplotlib.dates.YearLocator())
+    ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%Y"))
 fig.tight_layout()
 fig.savefig("monthly_counts_full.png", dpi=150)
 plt.close(fig)
