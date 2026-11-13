@@ -1,323 +1,343 @@
-"""Burning Activity Calendar — Egypt fire hotspots 2000-present.
+"""Fire Activity Explorer.
 
-Tabs:
-  1. Burning Calendar   - day-of-year x year activity heatmap for an AOI
-  2. Historical Patterns - seasonal climatology + monthly/yearly trends
-  3. Early Warnings      - 7-day anomaly detection vs climatology
-  4. Daily Explorer      - single-date density heatmap (original view)
+1. Search a country/region -> the map zooms to it.
+2. If data/<region>.csv (or .parquet) exists, fire bubbles, a burning calendar
+   heatmap, a "current month vs historical median" metric and a CSV download appear.
 
-Sensor eras are analyzed separately (MODIS <=2011, VIIRS >=2012) because
-their detection counts are not directly comparable.
+Expected data file columns (FIRMS download): latitude, longitude, acq_date
+Optional columns: instrument, satellite, confidence, frp, brightness, bright_ti4
+Put files in a "data" folder next to this script, named after the region:
+    data/egypt.csv   or   data/egypt.parquet
 """
 
-from datetime import date, timedelta
+import calendar
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
-import matplotlib
+from streamlit_autocomplete import st_textcomplete_autocomplete
 
-matplotlib.use("Agg")
-import matplotlib.dates
-import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm, PowerNorm
+st.set_page_config(page_title="Fire Activity Explorer", layout="wide")
 
-st.set_page_config(page_title="Egypt Fire Activity Calendar", layout="wide")
+NE_URL = "ne_countries.geojson"  # local copy of Natural Earth 110m countries
+DATA_DIR = Path("data")
 
-DATA = "hotspots_harmonized.parquet"
+# Scaling factor to turn MODIS counts into VIIRS-equivalent counts.
+# 1.0 = no adjustment. Replace it with the factor your analysts compute
+# from the overlap period (VIIRS total / MODIS total).
+MODIS_TO_VIIRS_FACTOR = 1.0
 
-AOIS = {
-    "All Egypt": (21.5, 32.0, 24.5, 36.0),
-    "Nile Delta": (30.4, 31.6, 29.5, 32.6),
-    "Nile Valley (Upper Egypt)": (24.0, 30.4, 29.5, 33.0),
-    "Western Desert": (22.0, 31.0, 25.0, 29.5),
-    "Eastern Desert": (22.0, 30.5, 32.5, 35.5),
-    "Sinai": (27.0, 31.3, 32.3, 34.9),
-    "North Coast": (30.6, 31.7, 24.5, 30.0),
-    "Red Sea Coast": (21.8, 28.5, 33.5, 36.5),
+# Common names that differ from Natural Earth's NAME field
+ALIASES = {
+    "ivory coast": "côte d'ivoire",
+    "east timor": "timor-leste",
+    "türkiye": "turkey",
+    "turkiye": "turkey",
+    "vatican city": "vatican",
+    "united states": "united states of america",
+    "sao tome": "são tomé and principe",
+    "bosnia and herzegovina": "bosnia and herz.",
+    "central african republic": "central african rep.",
+    "democratic republic of the congo": "dem. rep. congo",
+    "republic of the congo": "congo",
+    "dominican republic": "dominican rep.",
+    "solomon islands": "solomon is.",
+    "south sudan": "s. sudan",
+    "equatorial guinea": "eq. guinea",
+    "dr congo": "dem. rep. congo",
+    "drc": "dem. rep. congo",
+    "congo republic": "congo",
+    "czech republic": "czechia",
+}
+
+# Bboxes for microstates too small for the 110m dataset
+# (lat_min, lat_max, lon_min, lon_max)
+MANUAL_REGIONS = {
+    "andorra": (42.4, 42.75, 1.4, 1.8),
+    "liechtenstein": (47.0, 47.3, 9.5, 9.65),
+    "monaco": (43.72, 43.78, 7.4, 7.5),
+    "san marino": (43.88, 43.99, 12.4, 12.5),
+    "vatican": (41.89, 41.93, 12.44, 12.47),
+    "malta": (35.8, 36.1, 14.2, 14.65),
+    "singapore": (1.2, 1.5, 103.6, 104.1),
+    "bahrain": (25.7, 26.4, 50.3, 50.95),
+    "maldives": (-0.7, 7.4, 72.6, 73.9),
+    "mauritius": (-20.6, -19.9, 57.3, 57.95),
+    "seychelles": (-4.8, -4.5, 55.2, 55.7),
+    "comoros": (-13.0, -11.3, 43.1, 45.3),
+    "sao tome and principe": (0.0, 2.3, 6.2, 7.6),
+    "dominica": (15.15, 15.7, -61.55, -61.15),
+    "grenada": (11.9, 12.3, -61.85, -61.55),
+    "saint lucia": (13.7, 14.1, -61.1, -60.85),
+    "saint vincent and the grenadines": (12.5, 13.45, -61.55, -61.05),
+    "antigua and barbuda": (16.95, 17.75, -61.95, -61.6),
+    "saint kitts and nevis": (17.2, 17.45, -62.9, -62.55),
+    "barbados": (13.0, 13.45, -59.75, -59.35),
+    "trinidad and tobago": (10.0, 11.35, -61.95, -60.5),
+    "tonga": (-23.0, -15.4, -176.0, -173.0),
+    "samoa": (-14.05, -13.4, -172.85, -171.3),
+    "vanuatu": (-20.3, -13.0, 166.4, 170.2),
+    "kiribati": (-11.5, 5.0, 168.0, 180.0),
+    "tuvalu": (-11.2, -5.6, 175.0, 180.0),
+    "palau": (2.7, 8.2, 134.0, 134.8),
+    "marshall islands": (4.5, 15.0, 160.7, 172.2),
+    "nauru": (-0.55, -0.45, 166.85, 166.95),
+    "cape verde": (14.8, 17.2, -25.4, -22.6),
+}
+
+# Countries whose full bounding box zooms out too far (date line, far territories).
+# These always win over the automatic boxes.
+OVERRIDES = {
+    "france": (41.0, 51.5, -5.5, 9.8),
+    "united states of america": (24.0, 50.0, -125.0, -66.5),
+    "russia": (41.0, 70.0, 27.0, 180.0),
+    "fiji": (-20.3, -15.5, 176.5, 180.0),
+    "new zealand": (-47.5, -34.0, 166.0, 179.0),
+}
+
+WANTED_COLUMNS = {
+    "latitude", "longitude", "acq_date", "satellite", "instrument",
+    "confidence", "frp", "daynight", "brightness", "bright_ti4", "type",
 }
 
 
+# --------------------------------------------------------------------------
+# Regions
+# --------------------------------------------------------------------------
 @st.cache_data
-def load_data():
-    df = pd.read_parquet(DATA)
-    df["date"] = df["acq_datetime"].dt.date
-    df["doy"] = df["acq_datetime"].dt.dayofyear
-    df["year"] = df["acq_datetime"].dt.year
-    df["month"] = df["acq_datetime"].dt.to_period("M")
-    return df
+def load_regions():
+    """Return {search_name_lower: (lat_min, lat_max, lon_min, lon_max)}."""
+    import geopandas as gpd
+
+    world = gpd.read_file(NE_URL)
+    name_col = next(c for c in ("NAME", "name", "NAME_EN", "ADMIN") if c in world.columns)
+
+    regs = {}
+    for _, row in world.iterrows():
+        name = str(row[name_col]).lower()
+        minx, miny, maxx, maxy = row.geometry.bounds
+        regs[name] = (miny, maxy, minx, maxx)
+
+    for alias, target in ALIASES.items():
+        if target in regs and alias not in regs:
+            regs[alias] = regs[target]
+
+    for name, bbox in MANUAL_REGIONS.items():
+        regs.setdefault(name, bbox)
+
+    regs.update(OVERRIDES)
+    return regs
+
+
+# --------------------------------------------------------------------------
+# Hotspot data
+# --------------------------------------------------------------------------
+def infer_sensor(df: pd.DataFrame) -> pd.Series:
+    """Return a 'MODIS' / 'VIIRS' label for each row."""
+    if "instrument" in df.columns:
+        return df["instrument"].astype(str).str.upper().str.strip()
+    if "bright_ti4" in df.columns:
+        return pd.Series("VIIRS", index=df.index)
+    if "brightness" in df.columns:
+        return pd.Series("MODIS", index=df.index)
+    return pd.Series("UNKNOWN", index=df.index)
 
 
 @st.cache_data
-def egypt_boundary():
-    try:
-        import geopandas as gpd
+def load_hotspots(region_key: str):
+    """Load data/<region>.parquet or .csv, or return None if missing."""
+    stem = region_key.replace(" ", "_")
+    parquet = DATA_DIR / f"{stem}.parquet"
+    csv = DATA_DIR / f"{stem}.csv"
 
-        world = gpd.read_file(
-            "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
-            "master/geojson/ne_110m_admin_0_countries.geojson"
-        )
-        return world[world["ISO_A3"] == "EGY"]
-    except Exception:
+    if parquet.exists():
+        df = pd.read_parquet(parquet)
+        df = df[[c for c in df.columns if c in WANTED_COLUMNS]]
+    elif csv.exists():
+        df = pd.read_csv(csv, usecols=lambda c: c in WANTED_COLUMNS)
+    else:
         return None
 
+    df["acq_date"] = pd.to_datetime(df["acq_date"])
+    df["sensor"] = infer_sensor(df)
+    # weight = how much each hotspot counts after harmonization
+    df["weight"] = np.where(df["sensor"] == "MODIS", MODIS_TO_VIIRS_FACTOR, 1.0)
+    df["year"] = df["acq_date"].dt.year
+    df["month"] = df["acq_date"].dt.month
+    return df.drop_duplicates()
 
-df = load_data()
-egypt = egypt_boundary()
 
-st.title("Burning Activity Calendar — Egypt")
+def make_bubbles(df: pd.DataFrame, cell: float = 0.5) -> pd.DataFrame:
+    """Aggregate hotspots into grid cells so the map stays fast."""
+    g = df.assign(
+        lat=(df["latitude"] // cell) * cell + cell / 2,
+        lon=(df["longitude"] // cell) * cell + cell / 2,
+    )
+    return g.groupby(["lat", "lon"])["weight"].sum().reset_index(name="count")
+
+
+# --------------------------------------------------------------------------
+# Page
+# --------------------------------------------------------------------------
+st.title("Fire Activity Explorer")
 st.caption(
-    "Fire hotspot record harmonized across sensors: MODIS (Terra+Aqua) "
-    "2000–2011, VIIRS (Suomi-NPP) 2012–present · "
-    f"{len(df):,} detections · NASA FIRMS data"
+    "Search a country or region to zoom in. Fire data appears when a data file "
+    "for that region exists in the data folder."
 )
 
-# ------------------------------------------------------------ AOI select --
+try:
+    regions = load_regions()
+except Exception as e:
+    st.error(f"Could not load country boundaries: {e}")
+    st.stop()
 
-with st.sidebar:
-    st.header("Area of Interest")
-    aoi_name = st.selectbox("Preset region", list(AOIS.keys()), index=0)
-    if aoi_name == "Custom":
-        pass
-    custom = st.checkbox("Custom bounding box")
-    if custom:
-        la1 = st.number_input("Lat min", 21.5, 32.0, 21.5, 0.1)
-        la2 = st.number_input("Lat max", 21.5, 32.0, 32.0, 0.1)
-        lo1 = st.number_input("Lon min", 24.5, 36.5, 24.5, 0.1)
-        lo2 = st.number_input("Lon max", 24.5, 36.5, 36.0, 0.1)
-        bbox = (min(la1, la2), max(la1, la2), min(lo1, lo2), max(lo1, lo2))
-    else:
-        bbox = AOIS[aoi_name]
-    st.caption(f"Bounds: lat {bbox[0]:.1f}–{bbox[1]:.1f}, lon {bbox[2]:.1f}–{bbox[3]:.1f}")
+OPTIONS = sorted(k.title() for k in regions.keys())
 
-aoi = df[
-    (df.latitude >= bbox[0]) & (df.latitude <= bbox[1])
-    & (df.longitude >= bbox[2]) & (df.longitude <= bbox[3])
-].copy()
-
-
-def daily_activity(d):
-    """Daily detection count and FRP sum indexed by date."""
-    g = d.groupby("date").agg(count=("frp", "size"), frp=("frp", "sum"))
-    return g
-
-
-tab_cal, tab_hist, tab_warn, tab_day = st.tabs(
-    ["Burning Calendar", "Historical Patterns", "Early Warnings", "Daily Explorer"]
+selected = st_textcomplete_autocomplete(
+    "Search region",
+    OPTIONS,
+    key="region_pick",
+    placeholder="Type to search, e.g. 'egy', 'jap', 'bra'...",
+    height=300,
 )
 
-# ============================================================ CALENDAR ==
-
-with tab_cal:
-    st.subheader("Burning activity calendar")
-    st.caption(
-        "Each cell = total activity on that day-of-year for that year. "
-        "Bright vertical bands = fire season; bright horizontal lines = unusual years."
-    )
-    metric = st.radio("Activity metric", ["Detections", "FRP (MW)"], horizontal=True)
-
-    pivot = (
-        aoi.pivot_table(index="year", columns="doy", values="frp",
-                        aggfunc="count" if metric == "Detections" else "sum",
-                        fill_value=0)
-    )
-    years = list(range(int(df.year.min()), int(df.year.max()) + 1))
-    pivot = pivot.reindex(index=years, columns=range(1, 367), fill_value=0)
-
-    fig, ax = plt.subplots(figsize=(13, 7))
-    if metric == "Detections":
-        norm = PowerNorm(gamma=0.5, vmin=0.5)
+query = (selected or "").strip().lower()
+match = None
+if query:
+    if query in regions:
+        match = query
     else:
-        norm = PowerNorm(gamma=0.5, vmin=1)
-    im = ax.imshow(
-        pivot.to_numpy(), aspect="auto", origin="lower", cmap="inferno",
-        extent=[1, 366, years[0], years[-1] + 1], norm=norm,
-    )
-    fig.colorbar(im, ax=ax, label=metric)
+        cands = [k for k in regions if query in k]
+        if cands:
+            match = min(cands, key=len)
+bbox = regions[match] if match else None
 
-    # Month boundaries on x axis
-    month_starts = [1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335]
-    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-    ax.set_xticks(month_starts)
-    ax.set_xticklabels(month_names)
-    ax.set_yticks(years[::2])
-    ax.set_ylabel("Year")
-    ax.set_xlabel("Day of year")
-    ax.set_title(f"{aoi_name} — {metric.lower()} by day of year")
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+if match:
+    st.success(f"Showing: **{match.title()}**")
 
-# ============================================================ HISTORY ==
+# ---- Load and filter fire data -------------------------------------------
+sub = None
+bubbles = None
 
-with tab_hist:
-    st.subheader("Historical fire patterns")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("**Seasonal cycle** (mean daily activity by day of year)")
-        daily = daily_activity(aoi).reindex(
-            pd.date_range(str(df.date.min()), str(df.date.max())), fill_value=0
+if match:
+    hot = load_hotspots(match)
+    if hot is None or hot.empty:
+        st.info(
+            f"No fire data for {match.title()} yet. Add `data/{match.replace(' ', '_')}.csv` "
+            "(a FIRMS download) to see hotspots."
         )
-        daily["doy"] = daily.index.dayofyear
-        daily["year"] = daily.index.year
-        daily["sensor_era"] = np.where(daily["year"] <= 2011, "MODIS", "VIIRS")
-        clim = daily.groupby(["sensor_era", "doy"])["count"].mean().unstack(0)
-        clim = clim.reindex(range(1, 367)).interpolate()
-        fig, ax = plt.subplots(figsize=(8, 4))
-        colors = {"MODIS": "tab:orange", "VIIRS": "tab:blue"}
-        for era in clim.columns:
-            ax.plot(clim.index, clim[era], color=colors.get(era, "gray"),
-                    label=f"{era} climatology")
-        ax.set_xticks(month_starts)
-        ax.set_xticklabels(month_names)
-        ax.set_ylabel("mean detections / day")
-        ax.legend()
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
-        st.caption("Sensor eras plotted separately — raw counts are not comparable across the 2012 transition.")
-
-    with col2:
-        st.markdown("**Yearly totals**")
-        yearly = aoi.groupby(["year", "sensor"]).size().unstack(fill_value=0)
-        fig, ax = plt.subplots(figsize=(8, 4))
-        x = yearly.index
-        if "MODIS" in yearly:
-            ax.bar(x - 0.2, yearly["MODIS"], 0.4, color="tab:orange", label="MODIS")
-        if "VIIRS" in yearly:
-            ax.bar(x + 0.2, yearly["VIIRS"], 0.4, color="tab:blue", label="VIIRS")
-        ax.set_xticks(x)
-        ax.set_xticklabels(x, rotation=90, fontsize=7)
-        ax.set_ylabel("detections / year")
-        ax.legend()
-        fig.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
-
-    st.markdown("**Monthly totals**")
-    monthly = aoi.groupby(["month", "sensor"]).size().unstack(fill_value=0)
-    monthly.index = monthly.index.to_timestamp()
-    fig, ax = plt.subplots(figsize=(13, 3.5))
-    if "MODIS" in monthly:
-        ax.plot(monthly.index, monthly["MODIS"], color="tab:orange",
-                marker=".", markersize=3, label="MODIS")
-    if "VIIRS" in monthly:
-        ax.plot(monthly.index, monthly["VIIRS"], color="tab:blue",
-                marker=".", markersize=3, label="VIIRS")
-    ax.xaxis.set_major_locator(matplotlib.dates.YearLocator())
-    ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%Y"))
-    ax.set_ylabel("detections / month")
-    ax.legend()
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
-
-# =========================================================== WARNINGS ==
-
-with tab_warn:
-    st.subheader("Early warning — unusual fire activity")
-    st.caption(
-        "7-day rolling detection totals are compared against the climatology "
-        "for the same day-of-year within each sensor era. Periods with "
-        "z-score ≥ 2 are flagged as unusual."
-    )
-
-    daily = daily_activity(aoi)
-    # full date range so rolling windows don't break at gaps
-    idx = pd.date_range(str(daily.index.min()), str(daily.index.max()))
-    daily = daily.reindex(idx, fill_value=0)
-    daily["year"] = daily.index.year
-    daily["sensor_era"] = np.where(daily["year"] <= 2011, "MODIS", "VIIRS")
-    daily["roll7"] = daily.groupby("sensor_era")["count"].transform(
-        lambda s: s.rolling(7, center=True, min_periods=1).sum()
-    )
-    daily["doy"] = daily.index.dayofyear
-
-    clim = daily.groupby(["sensor_era", "doy"])["roll7"].agg(["mean", "std"])
-    clim["std"] = clim["std"].replace(0, np.nan)
-    daily = daily.join(clim, on=["sensor_era", "doy"])
-    daily["z"] = (daily["roll7"] - daily["mean"]) / daily["std"]
-
-    z_thresh = st.slider("Alert threshold (z-score)", 1.0, 4.0, 2.0, 0.25)
-    alerts = daily[daily["z"] >= z_thresh].copy()
-
-    if alerts.empty:
-        st.success("No periods exceed the threshold in this AOI.")
     else:
-        # group consecutive alert days (gap > 2 days starts a new period)
-        rows = []
-        grp = (alerts.index.to_series().diff() > pd.Timedelta(days=2)).cumsum()
-        for _, g in alerts.groupby(grp):
-            rows.append({
-                "start": g.index.min().date(),
-                "end": g.index.max().date(),
-                "days_flagged": len(g),
-                "peak_z": round(g["z"].max(), 1),
-                "7d_detections": int(g.loc[g["z"].idxmax(), "roll7"]),
-                "sensor_era": g["sensor_era"].iloc[0],
-            })
-        periods_df = pd.DataFrame(rows).sort_values("peak_z", ascending=False)
+        dmin = hot["acq_date"].min().date()
+        dmax = hot["acq_date"].max().date()
+        if dmin < dmax:
+            d0, d1 = st.slider("Date range", dmin, dmax, (dmin, dmax))
+        else:
+            d0, d1 = dmin, dmax
 
-        st.markdown(f"**{len(periods_df)} unusual periods** detected")
-        st.dataframe(periods_df, use_container_width=True, hide_index=True)
+        sub = hot[(hot["acq_date"].dt.date >= d0) & (hot["acq_date"].dt.date <= d1)]
+        if sub.empty:
+            st.warning("No hotspots in this date range.")
+            sub = None
+        else:
+            bubbles = make_bubbles(sub)
 
-        st.markdown("**Top critical periods by raw 7-day activity**")
-        top = daily.nlargest(10, "roll7")[
-            ["count", "roll7", "z", "frp", "sensor_era"]
-        ].rename(columns={
-            "count": "day_detections", "roll7": "7d_detections",
-            "frp": "7d_FRP_MW",
-        })
-        top.index = top.index.date
-        top.index.name = "window_center"
-        st.dataframe(top.round(1), use_container_width=True)
+# ---- Map -----------------------------------------------------------------
+geo_kwargs = dict(
+    projection_type="natural earth",
+    showland=True,
+    landcolor="#e8e8e8",
+    showocean=True,
+    oceancolor="#d0e4f5",
+    showcountries=True,
+    countrycolor="#bbbbbb",
+    scope="world",
+)
+if bbox:
+    pad = 1.0
+    geo_kwargs.pop("scope")
+    geo_kwargs["lonaxis_range"] = [bbox[2] - pad, bbox[3] + pad]
+    geo_kwargs["lataxis_range"] = [bbox[0] - pad, bbox[1] + pad]
 
-# ========================================================= DAILY VIEW ==
-
-with tab_day:
-    st.subheader("Daily hotspot explorer")
-    min_date, max_date = df["date"].min(), df["date"].max()
-    sel_date = st.date_input("Date", value=date(2020, 8, 15),
-                             min_value=min_date, max_value=max_date)
-    window = st.slider("Days around date", 0, 15, 0, key="daywin")
-    weight_conf = st.checkbox("Weight by confidence", value=True, key="wc")
-
-    start = sel_date - timedelta(days=window)
-    end = sel_date + timedelta(days=window)
-    day = aoi[(aoi["date"] >= start) & (aoi["date"] <= end)]
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Detections", f"{len(day):,}")
-    c2.metric("Mean FRP (MW)", f"{day['frp'].mean():.1f}" if len(day) else "—")
-    if len(day):
-        c3.metric("Day / Night",
-                  f"{(day['daynight'] == 'D').sum()} / {(day['daynight'] == 'N').sum()}")
-    else:
-        c3.metric("Day / Night", "—")
-
-    if len(day) == 0:
-        st.warning("No detections in this window — try nearby dates.")
-    else:
-        fig, ax = plt.subplots(figsize=(10, 8))
-        weights = (day["confidence_pct"] / 100.0) if weight_conf else None
-        h = ax.hist2d(
-            day["longitude"], day["latitude"], bins=80,
-            range=[[24.5, 36.5], [21.5, 32.5]], cmap="inferno", weights=weights,
+fig = go.Figure()
+if bubbles is not None and not bubbles.empty:
+    fig.add_trace(
+        go.Scattergeo(
+            lon=bubbles["lon"],
+            lat=bubbles["lat"],
+            mode="markers",
+            marker=dict(
+                size=np.clip(np.sqrt(bubbles["count"]) * 3, 4, 40),
+                color=bubbles["count"],
+                colorscale="YlOrRd",
+                showscale=True,
+                colorbar=dict(title="Hotspots"),
+                opacity=0.7,
+            ),
+            text=bubbles["count"].round().astype(int).astype(str) + " hotspots",
+            hoverinfo="text",
         )
-        plt.colorbar(h[3], ax=ax,
-                     label="confidence-weighted" if weight_conf else "detections")
-        if egypt is not None:
-            egypt.boundary.plot(ax=ax, color="white", linewidth=1.2, alpha=0.9)
-        ax.scatter(day["longitude"], day["latitude"], s=4, c="cyan",
-                   alpha=0.35, linewidths=0, zorder=5)
-        ax.set_xlim(24.5, 36.5)
-        ax.set_ylim(21.5, 32.5)
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-        ax.set_title(f"{aoi_name} — {start} → {end}" if window else f"{aoi_name} — {sel_date}")
-        ax.set_aspect("equal")
-        st.pyplot(fig)
-        plt.close(fig)
+    )
+else:
+    fig.add_trace(go.Scattergeo(lon=[], lat=[], mode="markers"))
+
+fig.update_geos(**geo_kwargs)
+fig.update_layout(height=650, margin=dict(l=0, r=0, t=30, b=0), geo=dict(bgcolor="white"))
+st.plotly_chart(fig, config={"displayModeBar": False}, key="worldmap")
+
+# ---- Calendar, median comparison, download -------------------------------
+if sub is not None:
+    st.subheader(f"Burning activity calendar: {match.title()}")
+
+    monthly = sub.groupby(["year", "month"])["weight"].sum().reset_index(name="count")
+    pivot = monthly.pivot(index="year", columns="month", values="count")
+    pivot = pivot.reindex(columns=range(1, 13)).fillna(0)
+    pivot.columns = [calendar.month_abbr[m] for m in pivot.columns]
+
+    heat = px.imshow(
+        pivot,
+        color_continuous_scale="Viridis",  # colorblind-friendly
+        labels=dict(x="Month", y="Year", color="Hotspots"),
+        aspect="auto",
+        text_auto=".0f",
+    )
+    heat.update_yaxes(type="category")
+    heat.update_layout(height=max(250, 60 * len(pivot) + 120))
+    st.plotly_chart(heat, use_container_width=True, key="calendar")
+
+    # Current (latest) month vs the historical median for that same month
+    latest = monthly.sort_values(["year", "month"]).iloc[-1]
+    ly, lm = int(latest["year"]), int(latest["month"])
+    current = float(latest["count"])
+    history = monthly[(monthly["month"] == lm) & (monthly["year"] < ly)]["count"]
+
+    c1, c2 = st.columns(2)
+    if len(history) > 0:
+        median = float(history.median())
+        c1.metric(
+            f"{calendar.month_name[lm]} {ly}",
+            f"{current:.0f} hotspots",
+            delta=f"{current - median:+.0f} vs historical median ({median:.0f})",
+            delta_color="inverse",  # more fire = worse = red
+        )
+    else:
+        c1.metric(f"{calendar.month_name[lm]} {ly}", f"{current:.0f} hotspots")
+        c2.info("Add more years of data to compare against the historical median.")
+
+    # Sensor breakdown (useful to check harmonization)
+    with st.expander("Hotspots per month by sensor (before harmonization factor)"):
+        by_sensor = (
+            sub.groupby([sub["acq_date"].dt.to_period("M").astype(str), "sensor"])
+            .size()
+            .unstack(fill_value=0)
+        )
+        st.line_chart(by_sensor)
+
+    st.download_button(
+        "Download filtered hotspots (CSV)",
+        sub.drop(columns=["weight", "year", "month"]).to_csv(index=False),
+        file_name=f"{match.replace(' ', '_')}_hotspots.csv",
+        mime="text/csv",
+    )
