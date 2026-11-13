@@ -1,4 +1,7 @@
 import pandas as pd
 
-df = pd.read_csv("viirs-jpss1_2020_Egypt.csv")
+df = pd.read_csv(
+    "viirs-jpss1_2020_Egypt_clean.csv",
+    parse_dates=["acq_datetime"],
+)
 print(df.head())
