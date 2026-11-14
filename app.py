@@ -245,9 +245,10 @@ if sub is not None:
 if view == "Points" and sub is not None:
     pts = sub[["latitude", "longitude", "acq_date", "sensor"]].copy()
     pts["acq_date"] = pts["acq_date"].dt.strftime("%Y-%m-%d")   # explore() can't serialize datetimes
-    if len(pts) > 40000:                                        # keep the browser fast
-        pts = pts.sample(40000, random_state=0)
-        st.caption("Showing a random sample of 40,000 hotspots on the map.")
+    MAX_POINTS = 5000                                          # Leaflet chokes on more
+    if len(pts) > MAX_POINTS:
+        pts = pts.sample(MAX_POINTS, random_state=0)
+        st.caption(f"Showing a random sample of {MAX_POINTS:,} hotspots on the map.")
 
     gdf = gpd.GeoDataFrame(
         pts,
@@ -277,8 +278,8 @@ elif view == "Density grid" and sub is not None:
                 .reset_index(name="count"))
 
     grid = _grid(cell)
-    if len(grid) > 8000:                        # too many circles -> coarsen
-        cell = 0.1
+    while len(grid) > 1500:                        # too many circles -> coarsen
+        cell *= 2
         grid = _grid(cell)
 
     center = [20, 0]
