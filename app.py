@@ -20,7 +20,6 @@ import streamlit as st
 import folium
 import geopandas as gpd
 from streamlit_folium import st_folium
-from streamlit_autocomplete import st_textcomplete_autocomplete
 from matplotlib import colormaps, colors
 import matplotlib.pyplot as plt
 
@@ -206,12 +205,12 @@ except Exception as e:
 
 OPTIONS = sorted(k.title() for k in regions.keys())
 
-selected = st_textcomplete_autocomplete(
+selected = st.selectbox(
     "Search region",
     OPTIONS,
-    key="region_pick",
+    index=None,
     placeholder="Type to search, e.g. 'egy', 'jap', 'bra'...",
-    height=300,
+    key="region_pick",
 )
 
 query = (selected or "").strip().lower()
