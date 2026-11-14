@@ -16,9 +16,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
+import folium
+import geopandas as gpd
+from streamlit_folium import st_folium
 from streamlit_autocomplete import st_textcomplete_autocomplete
+from matplotlib import colormaps, colors
 
 st.set_page_config(page_title="Fire Activity Explorer", layout="wide")
 
@@ -170,14 +173,6 @@ def load_hotspots(region_key: str):
     return df.drop_duplicates()
 
 
-def make_bubbles(df: pd.DataFrame, cell: float = 0.5) -> pd.DataFrame:
-    """Aggregate hotspots into grid cells so the map stays fast."""
-    g = df.assign(
-        lat=(df["latitude"] // cell) * cell + cell / 2,
-        lon=(df["longitude"] // cell) * cell + cell / 2,
-    )
-    return g.groupby(["lat", "lon"])["weight"].sum().reset_index(name="count")
-
 
 # --------------------------------------------------------------------------
 # Page
@@ -220,7 +215,6 @@ if match:
 
 # ---- Load and filter fire data -------------------------------------------
 sub = None
-bubbles = None
 
 if match:
     hot = load_hotspots(match)
@@ -241,51 +235,83 @@ if match:
         if sub.empty:
             st.warning("No hotspots in this date range.")
             sub = None
-        else:
-            bubbles = make_bubbles(sub)
 
 # ---- Map -----------------------------------------------------------------
-geo_kwargs = dict(
-    projection_type="natural earth",
-    showland=True,
-    landcolor="#e8e8e8",
-    showocean=True,
-    oceancolor="#d0e4f5",
-    showcountries=True,
-    countrycolor="#bbbbbb",
-    scope="world",
-)
-if bbox:
-    pad = 1.0
-    geo_kwargs.pop("scope")
-    geo_kwargs["lonaxis_range"] = [bbox[2] - pad, bbox[3] + pad]
-    geo_kwargs["lataxis_range"] = [bbox[0] - pad, bbox[1] + pad]
+view = "Points"
+if sub is not None:
+    view = st.radio("Map view", ["Points", "Density grid"], horizontal=True,
+                    key="mapview")
 
-fig = go.Figure()
-if bubbles is not None and not bubbles.empty:
-    fig.add_trace(
-        go.Scattergeo(
-            lon=bubbles["lon"],
-            lat=bubbles["lat"],
-            mode="markers",
-            marker=dict(
-                size=np.clip(np.sqrt(bubbles["count"]) * 3, 4, 40),
-                color=bubbles["count"],
-                colorscale="YlOrRd",
-                showscale=True,
-                colorbar=dict(title="Hotspots"),
-                opacity=0.7,
-            ),
-            text=bubbles["count"].round().astype(int).astype(str) + " hotspots",
-            hoverinfo="text",
-        )
+if view == "Points" and sub is not None:
+    pts = sub[["latitude", "longitude", "acq_date", "sensor"]].copy()
+    pts["acq_date"] = pts["acq_date"].dt.strftime("%Y-%m-%d")   # explore() can't serialize datetimes
+    if len(pts) > 40000:                                        # keep the browser fast
+        pts = pts.sample(40000, random_state=0)
+        st.caption("Showing a random sample of 40,000 hotspots on the map.")
+
+    gdf = gpd.GeoDataFrame(
+        pts,
+        geometry=gpd.points_from_xy(pts["longitude"], pts["latitude"]),
+        crs="EPSG:4326",
+    )
+    m = gdf.explore(
+        column="sensor",
+        categorical=True,
+        cmap=["red", "blue", "orange"],          # one color per sensor
+        marker_kwds=dict(radius=3),
+        style_kwds=dict(fillOpacity=0.15, weight=0),  # low opacity for overlaps
+        tooltip=["acq_date", "sensor"],
+        tiles="OpenStreetMap",
+        legend=True,
+    )
+elif view == "Density grid" and sub is not None:
+    # Aggregate detections into ~0.05° grid cells, colored by count
+    cell = 0.05
+
+    def _grid(c):
+        return (sub.assign(
+                    glat=(sub.latitude // c) * c + c / 2,
+                    glon=(sub.longitude // c) * c + c / 2,
+                )
+                .groupby(["glat", "glon"]).size()
+                .reset_index(name="count"))
+
+    grid = _grid(cell)
+    if len(grid) > 8000:                        # too many circles -> coarsen
+        cell = 0.1
+        grid = _grid(cell)
+
+    center = [20, 0]
+    zoom = 2
+    if bbox:
+        center = [(bbox[0] + bbox[1]) / 2, (bbox[2] + bbox[3]) / 2]
+        zoom = 6
+    m = folium.Map(location=center, zoom_start=zoom, tiles="OpenStreetMap")
+
+    maxc = int(grid["count"].max())
+    norm = colors.LogNorm(vmin=1, vmax=maxc)
+    cmap = colormaps["YlOrRd"]
+    radius_m = int(cell * 111320 * 0.6)
+    for r in grid.itertuples():
+        folium.Circle(
+            location=[r.glat, r.glon],
+            radius=radius_m,
+            color=colors.to_hex(cmap(norm(r.count))),
+            fill=True,
+            fill_opacity=0.55,
+            weight=0,
+        ).add_to(m)
+    st.caption(
+        f"Grid cell ≈ {cell}° (~{int(cell * 111)} km per side) · "
+        f"max {maxc} detections per cell"
     )
 else:
-    fig.add_trace(go.Scattergeo(lon=[], lat=[], mode="markers"))
+    m = folium.Map(location=[20, 0], zoom_start=2, tiles="OpenStreetMap")
 
-fig.update_geos(**geo_kwargs)
-fig.update_layout(height=650, margin=dict(l=0, r=0, t=30, b=0), geo=dict(bgcolor="white"))
-st.plotly_chart(fig, config={"displayModeBar": False}, key="worldmap")
+if bbox:
+    m.fit_bounds([[bbox[0], bbox[2]], [bbox[1], bbox[3]]])    # zoom to the selected country
+
+st_folium(m, height=650, use_container_width=True, returned_objects=[], key="map")
 
 # ---- Calendar, median comparison, download -------------------------------
 if sub is not None:
