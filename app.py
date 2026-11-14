@@ -245,10 +245,25 @@ if sub is not None:
 if view == "Points" and sub is not None:
     pts = sub[["latitude", "longitude", "acq_date", "sensor"]].copy()
     pts["acq_date"] = pts["acq_date"].dt.strftime("%Y-%m-%d")   # explore() can't serialize datetimes
-    MAX_POINTS = 5000                                          # Leaflet chokes on more
+    # ordered categorical -> deterministic colors: MODIS=red, VIIRS=blue
+    sensors = list(dict.fromkeys(pts["sensor"]))
+    cats = [s for s in ("MODIS", "VIIRS") if s in sensors] + \
+           [s for s in sensors if s not in ("MODIS", "VIIRS")]
+    pts["sensor"] = pd.Categorical(pts["sensor"], categories=cats, ordered=True)
+    sensor_colors = [
+        {"MODIS": "red", "VIIRS": "blue"}.get(c, "orange") for c in cats
+    ]
+    MAX_POINTS = 10000                                         # Leaflet chokes on more
     if len(pts) > MAX_POINTS:
-        pts = pts.sample(MAX_POINTS, random_state=0)
-        st.caption(f"Showing a random sample of {MAX_POINTS:,} hotspots on the map.")
+        # stratified sample: split evenly across sensors so rare MODIS shows
+        per_sensor = MAX_POINTS // pts["sensor"].nunique()
+        pts = pd.concat(
+            [g.sample(min(len(g), per_sensor), random_state=0)
+             for _, g in pts.groupby("sensor", observed=True)]
+        )
+        st.caption(
+            f"Showing up to {MAX_POINTS:,} hotspots (sampled evenly per sensor)."
+        )
 
     gdf = gpd.GeoDataFrame(
         pts,
@@ -258,7 +273,7 @@ if view == "Points" and sub is not None:
     m = gdf.explore(
         column="sensor",
         categorical=True,
-        cmap=["red", "blue", "orange"],          # one color per sensor
+        cmap=sensor_colors,                     # MODIS=red, VIIRS=blue
         marker_kwds=dict(radius=3),
         style_kwds=dict(fillOpacity=0.15, weight=0),  # low opacity for overlaps
         tooltip=["acq_date", "sensor"],
