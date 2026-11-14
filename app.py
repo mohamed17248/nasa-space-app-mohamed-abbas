@@ -346,6 +346,17 @@ else:
 if bbox:
     m.fit_bounds([[bbox[0], bbox[2]], [bbox[1], bbox[3]]])    # zoom to the selected country
 
+# Keep the Leaflet/OSM attribution readable (white-on-white fix)
+m.get_root().html.add_child(
+    folium.Element(
+        "<style>"
+        ".leaflet-control-attribution{background:rgba(255,255,255,.85)!important;"
+        "color:#333!important;font-size:10px}"
+        ".leaflet-control-attribution a{color:#06c!important}"
+        "</style>"
+    )
+)
+
 st_folium(m, height=650, use_container_width=True, returned_objects=[], key="map")
 
 # ---- Calendar, median comparison, download -------------------------------
