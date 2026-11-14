@@ -353,6 +353,11 @@ m.get_root().html.add_child(
         ".leaflet-control-attribution{background:rgba(255,255,255,.85)!important;"
         "color:#333!important;font-size:10px}"
         ".leaflet-control-attribution a{color:#06c!important}"
+        ".maplegend{background:rgba(255,255,255,.9)!important;"
+        "color:#333!important;padding:6px 10px!important;"
+        "border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,.3)}"
+        ".maplegend .legend-title,.maplegend li{color:#333!important}"
+        ".maplegend a{color:#06c!important}"
         "</style>"
     )
 )
