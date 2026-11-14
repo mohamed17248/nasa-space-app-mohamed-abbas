@@ -1,37 +1,50 @@
-"""Fire Activity Explorer.
+"""Fire Activity Explorer — Competition Edition.
 
-1. Search a country/region -> the map zooms to it.
-2. If data/<region>.csv (or .parquet) exists, fire bubbles, a burning calendar
-   heatmap, a "current month vs historical median" metric and a CSV download appear.
-
-Expected data file columns (FIRMS download): latitude, longitude, acq_date
-Optional columns: instrument, satellite, confidence, frp, brightness, bright_ti4
-Put files in a "data" folder next to this script, named after the region:
-    data/egypt.csv   or   data/egypt.parquet
+Multi-decade harmonized wildfire & thermal anomaly intelligence platform
+powered by NASA FIRMS (MODIS + VIIRS) and Natural Earth boundaries.
 """
 
 import calendar
+import json
 from pathlib import Path
 
+import folium
+from folium.plugins import FastMarkerCluster, HeatMap
+import geopandas as gpd
+from matplotlib import colormaps, colors
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
-import folium
-import geopandas as gpd
 from streamlit_folium import st_folium
-from matplotlib import colormaps, colors
-import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Fire Activity Explorer", layout="wide")
+st.set_page_config(
+    page_title="Fire Activity Explorer",
+    page_icon="🔥",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-NE_URL = "ne_countries.geojson"  # local copy of Natural Earth 110m countries
+# Subtle dark-accent styling for KPI cards
+st.markdown(
+    """
+    <style>
+    div[data-testid="stMetric"] {
+        background-color: rgba(255, 87, 34, 0.06);
+        border: 1px solid rgba(255, 87, 34, 0.22);
+        padding: 12px 16px;
+        border-radius: 10px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+NE_URL = "ne_countries.geojson"
 DATA_DIR = Path("data")
-
-# Fallback only — the real factor is computed per dataset from overlap years
 MODIS_TO_VIIRS_FACTOR = 1.0
 
-# Common names that differ from Natural Earth's NAME field
 ALIASES = {
     "ivory coast": "côte d'ivoire",
     "east timor": "timor-leste",
@@ -54,8 +67,6 @@ ALIASES = {
     "czech republic": "czechia",
 }
 
-# Bboxes for microstates too small for the 110m dataset
-# (lat_min, lat_max, lon_min, lon_max)
 MANUAL_REGIONS = {
     "andorra": (42.4, 42.75, 1.4, 1.8),
     "liechtenstein": (47.0, 47.3, 9.5, 9.65),
@@ -89,8 +100,6 @@ MANUAL_REGIONS = {
     "cape verde": (14.8, 17.2, -25.4, -22.6),
 }
 
-# Countries whose full bounding box zooms out too far (date line, far territories).
-# These always win over the automatic boxes.
 OVERRIDES = {
     "france": (41.0, 51.5, -5.5, 9.8),
     "united states of america": (24.0, 50.0, -125.0, -66.5),
@@ -100,42 +109,52 @@ OVERRIDES = {
 }
 
 WANTED_COLUMNS = {
-    "latitude", "longitude", "acq_date", "satellite", "instrument",
-    "confidence", "frp", "daynight", "brightness", "bright_ti4", "type",
+    "latitude", "longitude", "acq_date", "acq_time", "satellite",
+    "instrument", "confidence", "frp", "daynight", "brightness",
+    "bright_ti4", "bright_ti5", "type",
+}
+
+FIRE_TYPE_LABELS = {
+    0: "Vegetation / Wildfire",
+    1: "Active Volcano",
+    2: "Static / Industrial / Flare",
+    3: "Offshore",
 }
 
 
 # --------------------------------------------------------------------------
-# Regions
+# Regions & Geometries
 # --------------------------------------------------------------------------
 @st.cache_data
 def load_regions():
-    """Return {search_name_lower: (lat_min, lat_max, lon_min, lon_max)}."""
+    """Return (bboxes_dict, geojson_polygons_dict)."""
     world = gpd.read_file(NE_URL)
     name_col = next(c for c in ("NAME", "name", "NAME_EN", "ADMIN") if c in world.columns)
 
     regs = {}
+    polys = {}
     for _, row in world.iterrows():
         name = str(row[name_col]).lower()
         minx, miny, maxx, maxy = row.geometry.bounds
         regs[name] = (miny, maxy, minx, maxx)
+        polys[name] = json.loads(gpd.GeoSeries([row.geometry]).to_json())
 
     for alias, target in ALIASES.items():
         if target in regs and alias not in regs:
             regs[alias] = regs[target]
+            polys[alias] = polys[target]
 
     for name, bbox in MANUAL_REGIONS.items():
         regs.setdefault(name, bbox)
 
     regs.update(OVERRIDES)
-    return regs
+    return regs, polys
 
 
 # --------------------------------------------------------------------------
-# Hotspot data
+# Data Loading & Scientific Harmonization
 # --------------------------------------------------------------------------
 def infer_sensor(df: pd.DataFrame) -> pd.Series:
-    """Return a 'MODIS' / 'VIIRS' label for each row."""
     if "instrument" in df.columns:
         return df["instrument"].astype(str).str.upper().str.strip()
     if "bright_ti4" in df.columns:
@@ -145,307 +164,572 @@ def infer_sensor(df: pd.DataFrame) -> pd.Series:
     return pd.Series("UNKNOWN", index=df.index)
 
 
-@st.cache_data
-def load_hotspots(region_key: str):
-    """Load data/<region>.parquet or .csv -> (df, modis_to_viirs_factor).
+def normalize_confidence(series: pd.Series) -> pd.Series:
+    """Unify MODIS (0-100) and VIIRS ('l'/'n'/'h') confidence values."""
+    def _map_val(v):
+        if pd.isna(v):
+            return "Nominal"
+        s = str(v).strip().lower()
+        if s in ("l", "low"):
+            return "Low"
+        if s in ("n", "nominal"):
+            return "Nominal"
+        if s in ("h", "high"):
+            return "High"
+        try:
+            num = float(s)
+            if num < 30:
+                return "Low"
+            if num < 80:
+                return "Nominal"
+            return "High"
+        except ValueError:
+            return "Nominal"
 
-    Harmonization: MODIS detections are scaled by the VIIRS/MODIS count
-    ratio measured over the overlap years (years where both sensors exist),
-    and MODIS rows inside the VIIRS era are dropped so eras don't double count.
-    """
-    stem = region_key.replace(" ", "_")
-    parquet = DATA_DIR / f"{stem}.parquet"
-    csv = DATA_DIR / f"{stem}.csv"
+    return series.map(_map_val)
 
-    if parquet.exists():
-        df = pd.read_parquet(parquet)
-        df = df[[c for c in df.columns if c in WANTED_COLUMNS]]
-    elif csv.exists():
-        df = pd.read_csv(csv, usecols=lambda c: c in WANTED_COLUMNS)
-    else:
-        return None, MODIS_TO_VIIRS_FACTOR
 
+def prepare_hotspots(df: pd.DataFrame):
+    """Clean, enrich, and harmonize MODIS/VIIRS records."""
+    df = df[[c for c in df.columns if c in WANTED_COLUMNS]].copy()
     df["acq_date"] = pd.to_datetime(df["acq_date"])
     df["sensor"] = infer_sensor(df)
     df["year"] = df["acq_date"].dt.year
     df["month"] = df["acq_date"].dt.month
     df = df.drop_duplicates()
 
+    # Enrich NASA FIRMS metadata columns
+    if "type" in df.columns:
+        df["fire_type"] = (
+            pd.to_numeric(df["type"], errors="coerce")
+            .map(FIRE_TYPE_LABELS)
+            .fillna("Unclassified")
+        )
+    else:
+        df["fire_type"] = "Unclassified"
+
+    if "confidence" in df.columns:
+        df["conf_tier"] = normalize_confidence(df["confidence"])
+    else:
+        df["conf_tier"] = "Nominal"
+
+    if "daynight" in df.columns:
+        df["period"] = (
+            df["daynight"].astype(str).str.upper().str.strip()
+            .map({"D": "Daytime", "N": "Nighttime"})
+            .fillna("Unknown")
+        )
+    else:
+        df["period"] = "Unknown"
+
+    if "frp" in df.columns:
+        df["frp"] = pd.to_numeric(df["frp"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    else:
+        df["frp"] = 0.0
+
+    # Harmonize MODIS -> VIIRS equivalent
     factor = MODIS_TO_VIIRS_FACTOR
     viirs_years = df.loc[df["sensor"] == "VIIRS", "year"].unique()
     if len(viirs_years) and (df["sensor"] == "MODIS").any():
-        split = int(min(viirs_years))               # first VIIRS year
+        split = int(min(viirs_years))
         overlap = df[df["year"] >= split]
         n_modis = int((overlap["sensor"] == "MODIS").sum())
         n_viirs = int((overlap["sensor"] == "VIIRS").sum())
         if n_modis and n_viirs:
             factor = n_viirs / n_modis
-        # VIIRS era uses VIIRS only -> drop MODIS rows from split year on
         df = df[~((df["sensor"] == "MODIS") & (df["year"] >= split))]
 
     df["weight"] = np.where(df["sensor"] == "MODIS", factor, 1.0)
+    df["weighted_frp"] = df["frp"] * df["weight"]
     return df, factor
 
 
+@st.cache_data
+def load_local_hotspots(region_key: str):
+    """Check both data/<region>.* and ./<region>.* for Parquet or CSV."""
+    stem = region_key.replace(" ", "_")
+    candidates = [
+        DATA_DIR / f"{stem}.parquet",
+        Path(f"{stem}.parquet"),
+        DATA_DIR / f"{stem}.csv",
+        Path(f"{stem}.csv"),
+    ]
+    for path in candidates:
+        if path.exists():
+            raw = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
+            return prepare_hotspots(raw)
+    return None, MODIS_TO_VIIRS_FACTOR
+
+
+@st.cache_data(ttl=3600)
+def fetch_firms_nrt(map_key: str, source: str, bbox: tuple, days: int):
+    """Fetch near-real-time hotspots directly from NASA FIRMS Area API."""
+    lat_min, lat_max, lon_min, lon_max = bbox
+    area = f"{lon_min:.4f},{lat_min:.4f},{lon_max:.4f},{lat_max:.4f}"
+    url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{map_key.strip()}/{source}/{area}/{days}"
+    raw = pd.read_csv(url)
+    if raw.empty or "latitude" not in raw.columns:
+        return None, 1.0
+    return prepare_hotspots(raw)
+
 
 # --------------------------------------------------------------------------
-# Page
+# Sidebar Controls
 # --------------------------------------------------------------------------
-st.title("Fire Activity Explorer")
-st.caption(
-    "Search a country or region to zoom in. Fire data appears when a data file "
-    "for that region exists in the data folder."
-)
-
 try:
-    regions = load_regions()
+    regions, polygons = load_regions()
 except Exception as e:
-    st.error(f"Could not load country boundaries: {e}")
+    st.error(f"Could not load country boundaries (`{NE_URL}`): {e}")
     st.stop()
 
 OPTIONS = sorted(k.title() for k in regions.keys())
+default_idx = OPTIONS.index("Egypt") if "Egypt" in OPTIONS else None
 
-selected = st.selectbox(
-    "Search region",
-    OPTIONS,
-    index=None,
-    placeholder="Type to search, e.g. 'egy', 'jap', 'bra'...",
-    key="region_pick",
-)
+with st.sidebar:
+    st.header("🛰️ Explorer Controls")
+    selected = st.selectbox(
+        "Country / Region",
+        OPTIONS,
+        index=default_idx,
+        placeholder="Type to search (e.g. Egypt, Brazil)...",
+    )
+
+    st.divider()
+    st.subheader("Data Source")
+    uploaded_file = st.file_uploader(
+        "Upload FIRMS CSV or Parquet",
+        type=["csv", "parquet"],
+        help="Override local files with any NASA FIRMS download.",
+    )
+
+    with st.expander("🌐 Live NASA FIRMS API (Optional)"):
+        firms_key = st.text_input("FIRMS MAP_KEY", type="password", help="Free key from firms.modaps.eosdis.nasa.gov")
+        firms_source = st.selectbox(
+            "Satellite Feed",
+            ["VIIRS_SNPP_NRT", "VIIRS_NOAA20_NRT", "VIIRS_NOAA21_NRT", "MODIS_NRT"],
+        )
+        firms_days = st.slider("Lookback window (days)", 1, 10, 5)
+        use_live_api = st.checkbox("Fetch live NRT detections", value=False, disabled=not bool(firms_key))
 
 query = (selected or "").strip().lower()
-match = None
-if query:
-    if query in regions:
-        match = query
-    else:
-        cands = [k for k in regions if query in k]
-        if cands:
-            match = min(cands, key=len)
+match = query if query in regions else None
 bbox = regions[match] if match else None
+poly_geojson = polygons.get(match) if match else None
 
-if match:
-    st.success(f"Showing: **{match.title()}**")
+# --------------------------------------------------------------------------
+# Header & Data Resolution
+# --------------------------------------------------------------------------
+st.title("🔥 Fire Activity Explorer")
+st.caption(
+    "Harmonized multi-sensor satellite thermal intelligence (MODIS + VIIRS) "
+    "for wildfire monitoring, anomaly detection, and intensity analysis."
+)
 
-# ---- Load and filter fire data -------------------------------------------
+hot, factor, source_label = None, 1.0, ""
+if uploaded_file is not None:
+    raw_up = (
+        pd.read_parquet(uploaded_file)
+        if uploaded_file.name.endswith(".parquet")
+        else pd.read_csv(uploaded_file)
+    )
+    hot, factor = prepare_hotspots(raw_up)
+    source_label = f"Uploaded file: `{uploaded_file.name}`"
+elif match:
+    if use_live_api and firms_key and bbox:
+        with st.spinner(f"Querying NASA FIRMS ({firms_source}) for {match.title()}..."):
+            try:
+                hot, factor = fetch_firms_nrt(firms_key, firms_source, bbox, firms_days)
+                source_label = f"Live NASA FIRMS API (`{firms_source}`, last {firms_days}d)"
+            except Exception as exc:
+                st.warning(f"Live API request failed ({exc}); falling back to local archive.")
+    if hot is None:
+        hot, factor = load_local_hotspots(match)
+        source_label = f"Local archive (`{match.replace(' ', '_')}`)"
+
+# --------------------------------------------------------------------------
+# Sidebar Analytical Filters (when data exists)
+# --------------------------------------------------------------------------
 sub = None
+if hot is not None and not hot.empty:
+    with st.sidebar:
+        st.divider()
+        st.subheader("Telemetry Filters")
 
-if match:
-    hot, factor = load_hotspots(match)
-    if hot is None or hot.empty:
-        st.info(
-            f"No fire data for {match.title()} yet. Add `data/{match.replace(' ', '_')}.csv` "
-            "(a FIRMS download) to see hotspots."
-        )
-    else:
-        st.caption(
-            f"MODIS detections scaled ×{factor:.1f} to VIIRS-equivalent "
-            f"(factor computed from overlap years)."
-        )
-        dmin = hot["acq_date"].min().date()
-        dmax = hot["acq_date"].max().date()
+        dmin, dmax = hot["acq_date"].min().date(), hot["acq_date"].max().date()
         if dmin < dmax:
             d0, d1 = st.slider("Date range", dmin, dmax, (dmin, dmax))
         else:
             d0, d1 = dmin, dmax
 
-        sub = hot[(hot["acq_date"].dt.date >= d0) & (hot["acq_date"].dt.date <= d1)]
-        if sub.empty:
-            st.warning("No hotspots in this date range.")
-            sub = None
+        avail_types = sorted(hot["fire_type"].unique())
+        sel_types = st.multiselect("Thermal source type", avail_types, default=avail_types)
 
-# ---- Map -----------------------------------------------------------------
-view = "Points"
-if sub is not None:
-    view = st.radio("Map view", ["Points", "Density grid"], horizontal=True,
-                    key="mapview")
+        avail_conf = [c for c in ("High", "Nominal", "Low") if c in hot["conf_tier"].unique()]
+        sel_conf = st.multiselect("Detection confidence", avail_conf, default=avail_conf)
 
-if view == "Points" and sub is not None:
-    pts = sub[["latitude", "longitude", "acq_date", "sensor"]].copy()
-    pts["acq_date"] = pts["acq_date"].dt.strftime("%Y-%m-%d")   # explore() can't serialize datetimes
-    # ordered categorical -> deterministic colors: MODIS=red, VIIRS=blue
-    sensors = list(dict.fromkeys(pts["sensor"]))
-    cats = [s for s in ("MODIS", "VIIRS") if s in sensors] + \
-           [s for s in sensors if s not in ("MODIS", "VIIRS")]
-    pts["sensor"] = pd.Categorical(pts["sensor"], categories=cats, ordered=True)
-    sensor_colors = [
-        {"MODIS": "red", "VIIRS": "blue"}.get(c, "orange") for c in cats
-    ]
-    MAX_POINTS = 10000                                         # Leaflet chokes on more
-    if len(pts) > MAX_POINTS:
-        # stratified sample: split evenly across sensors so rare MODIS shows
-        per_sensor = MAX_POINTS // pts["sensor"].nunique()
-        pts = pd.concat(
-            [g.sample(min(len(g), per_sensor), random_state=0)
-             for _, g in pts.groupby("sensor", observed=True)]
-        )
-        st.caption(
-            f"Showing up to {MAX_POINTS:,} hotspots (sampled evenly per sensor). "
-            "Use Density grid to compare activity."
-        )
+        avail_periods = sorted(hot["period"].unique())
+        sel_periods = st.multiselect("Day / Night pass", avail_periods, default=avail_periods)
 
-    gdf = gpd.GeoDataFrame(
-        pts,
-        geometry=gpd.points_from_xy(pts["longitude"], pts["latitude"]),
-        crs="EPSG:4326",
+        min_frp = 0.0
+        if hot["frp"].max() > 0:
+            min_frp = st.number_input("Minimum FRP (MW)", min_value=0.0, value=0.0, step=5.0)
+
+    mask = (
+        (hot["acq_date"].dt.date >= d0)
+        & (hot["acq_date"].dt.date <= d1)
+        & (hot["fire_type"].isin(sel_types))
+        & (hot["conf_tier"].isin(sel_conf))
+        & (hot["period"].isin(sel_periods))
+        & (hot["frp"] >= min_frp)
     )
-    m = gdf.explore(
-        column="sensor",
-        categorical=True,
-        cmap=sensor_colors,                     # MODIS=red, VIIRS=blue
-        marker_kwds=dict(radius=3),
-        style_kwds=dict(fillOpacity=0.15, weight=0),  # low opacity for overlaps
-        tooltip=["acq_date", "sensor"],
-        tiles="OpenStreetMap",
-        legend=True,
+    sub = hot[mask].copy()
+
+# --------------------------------------------------------------------------
+# Executive KPIs & Automated Insight Banner
+# --------------------------------------------------------------------------
+if match and (hot is None or hot.empty):
+    st.info(
+        f"Showing boundaries for **{match.title()}**. No local hotspot file found "
+        f"(`data/{match.replace(' ', '_')}.parquet`). Upload a FIRMS file or enable the "
+        "Live NASA FIRMS API in the sidebar to populate analytics."
     )
-elif view == "Density grid" and sub is not None:
-    # Aggregate detections into ~0.05° grid cells, colored by count
-    cell = 0.05
+elif sub is not None and sub.empty:
+    st.warning("No hotspots match the current sidebar filters. Broaden your filter selection.")
 
-    def _grid(c):
-        return (sub.assign(
-                    glat=(sub.latitude // c) * c + c / 2,
-                    glon=(sub.longitude // c) * c + c / 2,
-                )
-                .groupby(["glat", "glon"])["weight"].sum()
-                .reset_index(name="count"))
+if sub is not None and not sub.empty:
+    total_weighted = sub["weight"].sum()
+    has_frp = sub["frp"].sum() > 0
+    total_frp_gw = sub["weighted_frp"].sum() / 1000.0
+    veg_share = (sub["fire_type"] == "Vegetation / Wildfire").mean() * 100
 
-    grid = _grid(cell)
-    while len(grid) > 1500:                        # too many circles -> coarsen
-        cell *= 2
-        grid = _grid(cell)
-
-    center = [20, 0]
-    zoom = 2
-    if bbox:
-        center = [(bbox[0] + bbox[1]) / 2, (bbox[2] + bbox[3]) / 2]
-        zoom = 6
-    m = folium.Map(location=center, zoom_start=zoom, tiles="OpenStreetMap")
-
-    maxc = max(1, int(round(grid["count"].max())))
-    norm = colors.LogNorm(vmin=1, vmax=maxc)
-    cmap = colormaps["YlOrRd"]
-    radius_m = int(cell * 111320 * 0.6)
-    for r in grid.itertuples():
-        folium.Circle(
-            location=[r.glat, r.glon],
-            radius=radius_m,
-            color=colors.to_hex(cmap(norm(r.count))),
-            fill=True,
-            fill_opacity=0.55,
-            weight=0,
-        ).add_to(m)
-    st.caption(
-        f"Grid cell ≈ {cell}° (~{int(cell * 111)} km per side) · "
-        f"max {maxc} detections per cell"
-    )
-else:
-    m = folium.Map(location=[20, 0], zoom_start=2, tiles="OpenStreetMap")
-
-if bbox:
-    m.fit_bounds([[bbox[0], bbox[2]], [bbox[1], bbox[3]]])    # zoom to the selected country
-
-# Keep the Leaflet/OSM attribution readable (white-on-white fix)
-m.get_root().html.add_child(
-    folium.Element(
-        "<style>"
-        ".leaflet-control-attribution{background:rgba(255,255,255,.85)!important;"
-        "color:#333!important;font-size:10px}"
-        ".leaflet-control-attribution a{color:#06c!important}"
-        ".maplegend{background:rgba(255,255,255,.9)!important;"
-        "color:#333!important;padding:6px 10px!important;"
-        "border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,.3)}"
-        ".maplegend .legend-title,.maplegend li{color:#333!important}"
-        ".maplegend a{color:#06c!important}"
-        "</style>"
-    )
-)
-
-st_folium(m, height=650, use_container_width=True, returned_objects=[], key="map")
-
-# ---- Calendar, median comparison, download -------------------------------
-if sub is not None:
-    st.subheader(f"Burning activity calendar: {match.title()}")
-
-    monthly = sub.groupby(["year", "month"])["weight"].sum().reset_index(name="count")
-    pivot = monthly.pivot(index="year", columns="month", values="count")
-    pivot = pivot.reindex(columns=range(1, 13)).fillna(0)
-    pivot.columns = [calendar.month_abbr[mo] for mo in pivot.columns]
-
-    heat = px.imshow(
-        pivot,
-        color_continuous_scale="Viridis",  # colorblind-friendly
-        labels=dict(x="Month", y="Year", color="Hotspots"),
-        aspect="auto",
-        text_auto=".0f",
-    )
-    heat.update_yaxes(type="category")
-    heat.update_layout(height=max(250, 60 * len(pivot) + 120))
-    st.plotly_chart(heat, use_container_width=True, key="calendar")
-
-    # Harmonization check: yearly totals per sensor should join smoothly
-    with st.expander("Harmonization check — yearly totals by sensor"):
-        yearly = (
-            sub.groupby(["year", "sensor"])["weight"].sum()
-            .unstack(fill_value=0)
-        )
-        fig_y, ax_y = plt.subplots(figsize=(10, 3.5))
-        if "MODIS" in yearly:
-            ax_y.plot(yearly.index, yearly["MODIS"], color="tab:red",
-                      marker=".", markersize=3, label="MODIS (scaled)")
-        if "VIIRS" in yearly:
-            ax_y.plot(yearly.index, yearly["VIIRS"], color="tab:blue",
-                      marker=".", markersize=3, label="VIIRS")
-        ax_y.set_ylabel("detections / year")
-        ax_y.legend()
-        fig_y.tight_layout()
-        st.pyplot(fig_y)
-        plt.close(fig_y)
-        st.caption(
-            "If harmonization worked, the MODIS line (scaled) and VIIRS line "
-            "should meet smoothly around the sensor transition."
-        )
-
-    # Latest (possibly partial) month vs same day-range in past years
+    # Latest month anomaly vs historical same day-of-month median
     latest_date = sub["acq_date"].max()
     ly, lm, last_day = latest_date.year, latest_date.month, latest_date.day
-
-    current = sub[(sub.year == ly) & (sub.month == lm)]["weight"].sum()
-
+    current_mo = sub[(sub["year"] == ly) & (sub["month"] == lm)]["weight"].sum()
     past_years = sorted(y for y in sub["year"].unique() if y < ly)
     hist = (
-        sub[(sub.month == lm) & (sub.year < ly) & (sub.acq_date.dt.day <= last_day)]
-        .groupby("year")["weight"].sum()
+        sub[(sub["month"] == lm) & (sub["year"] < ly) & (sub["acq_date"].dt.day <= last_day)]
+        .groupby("year")["weight"]
+        .sum()
         .reindex(past_years, fill_value=0)
     )
 
-    c1, c2 = st.columns(2)
-    label = f"{calendar.month_name[lm]} {ly} (days 1 to {last_day})"
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(
+        "Harmonized Detections",
+        f"{total_weighted:,.0f}",
+        help=f"MODIS detections scaled ×{factor:.2f} to VIIRS-equivalent.",
+    )
+    k2.metric(
+        "Radiative Energy (FRP)",
+        f"{total_frp_gw:,.2f} GW" if has_frp else "N/A",
+        delta=f"Median {sub['frp'].median():.1f} MW / event" if has_frp else None,
+        delta_color="off",
+    )
+    k3.metric(
+        "Vegetation Fire Share",
+        f"{veg_share:.1f}%" if "Unclassified" not in sub["fire_type"].unique() else "N/A",
+        delta="vs. static industrial/flares" if "Unclassified" not in sub["fire_type"].unique() else None,
+        delta_color="off",
+    )
+    latest_label = f"{calendar.month_abbr[lm]} {ly} (1–{last_day})"
     if len(hist) > 0:
-        median = float(hist.median())
-        c1.metric(
-            label,
-            f"{current:.0f} hotspots",
-            delta=f"{current - median:+.0f} vs historical median ({median:.0f})",
-            delta_color="inverse",  # more fire = worse = red
+        med = float(hist.median())
+        pct = ((current_mo - med) / med * 100) if med > 0 else 0.0
+        k4.metric(
+            latest_label,
+            f"{current_mo:,.0f}",
+            delta=f"{current_mo - med:+,.0f} ({pct:+.0f}%) vs median",
+            delta_color="inverse",
         )
     else:
-        c1.metric(label, f"{current:.0f} hotspots")
-        c2.info("Add more years of data to compare against the historical median.")
+        k4.metric(latest_label, f"{current_mo:,.0f}")
 
-    # Sensor breakdown (useful to check harmonization)
-    with st.expander("Hotspots per month by sensor (before harmonization factor)"):
-        by_sensor = (
-            sub.groupby([sub["acq_date"].dt.to_period("M").astype(str), "sensor"])
-            .size()
-            .unstack(fill_value=0)
-        )
-        st.line_chart(by_sensor)
-
-    st.download_button(
-        "Download filtered hotspots (CSV)",
-        sub.drop(columns=["weight", "year", "month"]).to_csv(index=False),
-        file_name=f"{match.replace(' ', '_')}_hotspots.csv",
-        mime="text/csv",
+    # Automated narrative takeaway
+    peak_mo_num = int(sub.groupby("month")["weight"].sum().idxmax())
+    peak_mo_name = calendar.month_name[peak_mo_num]
+    st.caption(
+        f"Source: {source_label} · Harmonization factor: **×{factor:.2f}** · "
+        f"Seasonal peak occurs in **{peak_mo_name}**."
     )
+
+# --------------------------------------------------------------------------
+# Main Analytical Tabs
+# --------------------------------------------------------------------------
+tab_map, tab_season, tab_intensity, tab_qa = st.tabs(
+    [
+        "🗺️ Spatial Map Explorer",
+        "📅 Seasonality & Anomalies",
+        "⚡ Fire Intensity (FRP) & Diurnal",
+        "🔬 Sensor Harmonization & Export",
+    ]
+)
+
+# ---- TAB 1: MAP ----------------------------------------------------------
+with tab_map:
+    c_mode, c_tiles, c_weight = st.columns([2, 2, 2])
+    map_mode = c_mode.radio(
+        "Visualization layer",
+        ["Density grid", "Clustered points", "Thermal heatmap"],
+        horizontal=True,
+    )
+    basemap_choice = c_tiles.selectbox(
+        "Basemap",
+        ["CartoDB dark_matter", "Esri Satellite", "OpenStreetMap"],
+    )
+    weight_metric = c_weight.selectbox(
+        "Intensity weighting",
+        ["Harmonized count", "Fire Radiative Power (FRP)"] if (sub is not None and sub["frp"].sum() > 0) else ["Harmonized count"],
+    )
+
+    center = [(bbox[0] + bbox[1]) / 2, (bbox[2] + bbox[3]) / 2] if bbox else [20, 0]
+    m = folium.Map(location=center, zoom_start=5 if bbox else 2, tiles=None)
+
+    if basemap_choice == "CartoDB dark_matter":
+        folium.TileLayer("CartoDB dark_matter", name="Dark Matter").add_to(m)
+    elif basemap_choice == "Esri Satellite":
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="Esri World Imagery",
+            name="Satellite",
+        ).add_to(m)
+    else:
+        folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
+
+    # Highlight selected country boundary
+    if poly_geojson is not None:
+        folium.GeoJson(
+            poly_geojson,
+            name="Region boundary",
+            style_function=lambda _: {
+                "fillColor": "transparent",
+                "color": "#ff7043",
+                "weight": 2,
+                "dashArray": "5, 5",
+            },
+        ).add_to(m)
+
+    if sub is not None and not sub.empty:
+        val_col = "weighted_frp" if weight_metric == "Fire Radiative Power (FRP)" else "weight"
+
+        if map_mode == "Density grid":
+            cell = 0.05
+
+            def _agg_grid(c):
+                return (
+                    sub.assign(
+                        glat=(sub["latitude"] // c) * c + c / 2,
+                        glon=(sub["longitude"] // c) * c + c / 2,
+                    )
+                    .groupby(["glat", "glon"], as_index=False)
+                    .agg(
+                        score=(val_col, "sum"),
+                        detections=("weight", "sum"),
+                        total_frp=("frp", "sum"),
+                        top_type=("fire_type", lambda s: s.mode().iloc[0]),
+                    )
+                )
+
+            grid = _agg_grid(cell)
+            while len(grid) > 1500:
+                cell *= 2
+                grid = _agg_grid(cell)
+
+            max_score = max(1.0, float(grid["score"].max()))
+            norm = colors.LogNorm(vmin=1.0, vmax=max_score)
+            cmap = colormaps["YlOrRd"]
+            radius_m = int(cell * 111320 * 0.58)
+
+            for r in grid.itertuples():
+                tip = (
+                    f"<b>Detections:</b> {r.detections:,.0f}<br>"
+                    f"<b>Total FRP:</b> {r.total_frp:,.1f} MW<br>"
+                    f"<b>Dominant type:</b> {r.top_type}"
+                )
+                folium.Circle(
+                    location=[r.glat, r.glon],
+                    radius=radius_m,
+                    color=colors.to_hex(cmap(norm(max(1.0, r.score)))),
+                    fill=True,
+                    fill_opacity=0.62,
+                    weight=0,
+                    tooltip=folium.Tooltip(tip),
+                ).add_to(m)
+            st.caption(f"Grid resolution: ~{cell:.2f}° (~{int(cell * 111)} km) · Hover any cell for telemetry.")
+
+        elif map_mode == "Clustered points":
+            pts = sub.sample(min(len(sub), 25000), random_state=42)
+            coords = pts[["latitude", "longitude"]].values.tolist()
+            FastMarkerCluster(coords).add_to(m)
+            if len(sub) > 25000:
+                st.caption("Showing 25,000 sampled points in interactive clusters.")
+
+        elif map_mode == "Thermal heatmap":
+            pts = sub.sample(min(len(sub), 30000), random_state=42)
+            heat_data = list(
+                zip(
+                    pts["latitude"],
+                    pts["longitude"],
+                    np.log1p(pts[val_col]),
+                )
+            )
+            HeatMap(heat_data, radius=14, blur=18, min_opacity=0.35).add_to(m)
+
+    if bbox:
+        m.fit_bounds([[bbox[0], bbox[2]], [bbox[1], bbox[3]]])
+
+    st_folium(m, height=600, use_container_width=True, returned_objects=[], key="main_map")
+
+# ---- TAB 2: SEASONALITY & ANOMALIES --------------------------------------
+with tab_season:
+    if sub is None or sub.empty:
+        st.info("Select a region with fire data to view multi-year seasonality.")
+    else:
+        st.subheader(f"Burning Activity Calendar — {match.title() if match else 'Dataset'}")
+        monthly = sub.groupby(["year", "month"])["weight"].sum().reset_index(name="count")
+        pivot = monthly.pivot(index="year", columns="month", values="count").reindex(columns=range(1, 13)).fillna(0)
+        pivot.columns = [calendar.month_abbr[mo] for mo in pivot.columns]
+
+        heat = px.imshow(
+            pivot,
+            color_continuous_scale="Inferno",
+            labels=dict(x="Month", y="Year", color="Hotspots"),
+            aspect="auto",
+            text_auto=".0f",
+        )
+        heat.update_yaxes(type="category")
+        heat.update_layout(height=max(280, 52 * len(pivot) + 120))
+        st.plotly_chart(heat, use_container_width=True)
+
+        # Monthly climatology envelope (Min / Median / Max across years)
+        if len(pivot) >= 2:
+            st.subheader("Seasonal Regime (Historical Envelope)")
+            clim = pd.DataFrame(
+                {
+                    "Month": pivot.columns,
+                    "Median": pivot.median(axis=0).values,
+                    "Min": pivot.min(axis=0).values,
+                    "Max": pivot.max(axis=0).values,
+                }
+            )
+            fig_clim = go.Figure()
+            fig_clim.add_trace(
+                go.Scatter(
+                    x=clim["Month"], y=clim["Max"], mode="lines",
+                    line=dict(width=0), showlegend=False, name="Max",
+                )
+            )
+            fig_clim.add_trace(
+                go.Scatter(
+                    x=clim["Month"], y=clim["Min"], mode="lines",
+                    line=dict(width=0), fill="tonexty",
+                    fillcolor="rgba(255, 112, 67, 0.2)", name="Historical Min–Max Range",
+                )
+            )
+            fig_clim.add_trace(
+                go.Scatter(
+                    x=clim["Month"], y=clim["Median"], mode="lines+markers",
+                    line=dict(color="#ff7043", width=3), name="Historical Median",
+                )
+            )
+            fig_clim.update_layout(yaxis_title="Harmonized Detections", height=340)
+            st.plotly_chart(fig_clim, use_container_width=True)
+
+# ---- TAB 3: FIRE INTENSITY & DIURNAL -------------------------------------
+with tab_intensity:
+    if sub is None or sub.empty:
+        st.info("Select a region with fire data to analyze radiative power and source types.")
+    else:
+        c_left, c_right = st.columns(2)
+
+        with c_left:
+            st.subheader("Detections by Thermal Source Type")
+            by_type = (
+                sub.groupby(["year", "fire_type"])["weight"]
+                .sum()
+                .reset_index(name="detections")
+            )
+            fig_type = px.bar(
+                by_type,
+                x="year",
+                y="detections",
+                color="fire_type",
+                barmode="stack",
+                labels={"year": "Year", "detections": "Harmonized Detections", "fire_type": "Source Type"},
+            )
+            fig_type.update_xaxes(type="category")
+            st.plotly_chart(fig_type, use_container_width=True)
+
+        with c_right:
+            st.subheader("Diurnal Cycle (Day vs. Night Passes)")
+            by_dn = (
+                sub.groupby(["month", "period"])["weight"]
+                .sum()
+                .reset_index(name="detections")
+            )
+            by_dn["Month"] = by_dn["month"].map(lambda m: calendar.month_abbr[m])
+            fig_dn = px.bar(
+                by_dn,
+                x="Month",
+                y="detections",
+                color="period",
+                barmode="group",
+                category_orders={"Month": list(calendar.month_abbr[1:])},
+                labels={"detections": "Harmonized Detections", "period": "Overpass"},
+            )
+            st.plotly_chart(fig_dn, use_container_width=True)
+
+        if sub["frp"].sum() > 0:
+            st.subheader("Monthly Fire Radiative Power (Total MW)")
+            frp_mo = (
+                sub.groupby(["year", "month"])["weighted_frp"]
+                .sum()
+                .reset_index()
+            )
+            frp_mo["Date"] = pd.to_datetime(
+                frp_mo["year"].astype(str) + "-" + frp_mo["month"].astype(str).str.zfill(2) + "-01"
+            )
+            fig_frp = px.area(
+                frp_mo,
+                x="Date",
+                y="weighted_frp",
+                labels={"weighted_frp": "Harmonized FRP (MW)"},
+                color_discrete_sequence=["#ff5722"],
+            )
+            st.plotly_chart(fig_frp, use_container_width=True)
+
+# ---- TAB 4: HARMONIZATION & EXPORT ---------------------------------------
+with tab_qa:
+    if sub is None or sub.empty:
+        st.info("Select a region with fire data to inspect sensor calibration and export records.")
+    else:
+        st.subheader("MODIS → VIIRS Cross-Sensor Calibration")
+        st.markdown(
+            f"Because VIIRS (375 m resolution) detects significantly more small thermal anomalies "
+            f"than MODIS (1 km resolution), raw multi-decade counts create an artificial jump at the "
+            f"sensor transition. Over the overlap period, MODIS detections are scaled by **×{factor:.2f}** "
+            f"and superseded by VIIRS once full coverage begins."
+        )
+        yearly_sensor = (
+            sub.groupby(["year", "sensor"])["weight"]
+            .sum()
+            .reset_index(name="harmonized_detections")
+        )
+        fig_cal = px.line(
+            yearly_sensor,
+            x="year",
+            y="harmonized_detections",
+            color="sensor",
+            markers=True,
+            color_discrete_map={"MODIS": "#ef5350", "VIIRS": "#42a5f5"},
+            labels={"year": "Year", "harmonized_detections": "Annual Harmonized Detections"},
+        )
+        st.plotly_chart(fig_cal, use_container_width=True)
+
+        export_df = sub.drop(columns=["weight", "weighted_frp", "year", "month"], errors="ignore")
+        st.download_button(
+            "⬇️ Download Filtered & Enriched Dataset (CSV)",
+            export_df.to_csv(index=False),
+            file_name=f"{(match or 'region').replace(' ', '_')}_hotspots_enriched.csv",
+            mime="text/csv",
+        )
