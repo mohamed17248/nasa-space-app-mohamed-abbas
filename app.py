@@ -22,15 +22,14 @@ import geopandas as gpd
 from streamlit_folium import st_folium
 from streamlit_autocomplete import st_textcomplete_autocomplete
 from matplotlib import colormaps, colors
+import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Fire Activity Explorer", layout="wide")
 
 NE_URL = "ne_countries.geojson"  # local copy of Natural Earth 110m countries
 DATA_DIR = Path("data")
 
-# Scaling factor to turn MODIS counts into VIIRS-equivalent counts.
-# 1.0 = no adjustment. Replace it with the factor your analysts compute
-# from the overlap period (VIIRS total / MODIS total).
+# Fallback only — the real factor is computed per dataset from overlap years
 MODIS_TO_VIIRS_FACTOR = 1.0
 
 # Common names that differ from Natural Earth's NAME field
@@ -113,8 +112,6 @@ WANTED_COLUMNS = {
 @st.cache_data
 def load_regions():
     """Return {search_name_lower: (lat_min, lat_max, lon_min, lon_max)}."""
-    import geopandas as gpd
-
     world = gpd.read_file(NE_URL)
     name_col = next(c for c in ("NAME", "name", "NAME_EN", "ADMIN") if c in world.columns)
 
@@ -151,7 +148,12 @@ def infer_sensor(df: pd.DataFrame) -> pd.Series:
 
 @st.cache_data
 def load_hotspots(region_key: str):
-    """Load data/<region>.parquet or .csv, or return None if missing."""
+    """Load data/<region>.parquet or .csv -> (df, modis_to_viirs_factor).
+
+    Harmonization: MODIS detections are scaled by the VIIRS/MODIS count
+    ratio measured over the overlap years (years where both sensors exist),
+    and MODIS rows inside the VIIRS era are dropped so eras don't double count.
+    """
     stem = region_key.replace(" ", "_")
     parquet = DATA_DIR / f"{stem}.parquet"
     csv = DATA_DIR / f"{stem}.csv"
@@ -162,15 +164,28 @@ def load_hotspots(region_key: str):
     elif csv.exists():
         df = pd.read_csv(csv, usecols=lambda c: c in WANTED_COLUMNS)
     else:
-        return None
+        return None, MODIS_TO_VIIRS_FACTOR
 
     df["acq_date"] = pd.to_datetime(df["acq_date"])
     df["sensor"] = infer_sensor(df)
-    # weight = how much each hotspot counts after harmonization
-    df["weight"] = np.where(df["sensor"] == "MODIS", MODIS_TO_VIIRS_FACTOR, 1.0)
     df["year"] = df["acq_date"].dt.year
     df["month"] = df["acq_date"].dt.month
-    return df.drop_duplicates()
+    df = df.drop_duplicates()
+
+    factor = MODIS_TO_VIIRS_FACTOR
+    viirs_years = df.loc[df["sensor"] == "VIIRS", "year"].unique()
+    if len(viirs_years) and (df["sensor"] == "MODIS").any():
+        split = int(min(viirs_years))               # first VIIRS year
+        overlap = df[df["year"] >= split]
+        n_modis = int((overlap["sensor"] == "MODIS").sum())
+        n_viirs = int((overlap["sensor"] == "VIIRS").sum())
+        if n_modis and n_viirs:
+            factor = n_viirs / n_modis
+        # VIIRS era uses VIIRS only -> drop MODIS rows from split year on
+        df = df[~((df["sensor"] == "MODIS") & (df["year"] >= split))]
+
+    df["weight"] = np.where(df["sensor"] == "MODIS", factor, 1.0)
+    return df, factor
 
 
 
@@ -217,13 +232,17 @@ if match:
 sub = None
 
 if match:
-    hot = load_hotspots(match)
+    hot, factor = load_hotspots(match)
     if hot is None or hot.empty:
         st.info(
             f"No fire data for {match.title()} yet. Add `data/{match.replace(' ', '_')}.csv` "
             "(a FIRMS download) to see hotspots."
         )
     else:
+        st.caption(
+            f"MODIS detections scaled ×{factor:.1f} to VIIRS-equivalent "
+            f"(factor computed from overlap years)."
+        )
         dmin = hot["acq_date"].min().date()
         dmax = hot["acq_date"].max().date()
         if dmin < dmax:
@@ -262,7 +281,8 @@ if view == "Points" and sub is not None:
              for _, g in pts.groupby("sensor", observed=True)]
         )
         st.caption(
-            f"Showing up to {MAX_POINTS:,} hotspots (sampled evenly per sensor)."
+            f"Showing up to {MAX_POINTS:,} hotspots (sampled evenly per sensor). "
+            "Use Density grid to compare activity."
         )
 
     gdf = gpd.GeoDataFrame(
@@ -289,7 +309,7 @@ elif view == "Density grid" and sub is not None:
                     glat=(sub.latitude // c) * c + c / 2,
                     glon=(sub.longitude // c) * c + c / 2,
                 )
-                .groupby(["glat", "glon"]).size()
+                .groupby(["glat", "glon"])["weight"].sum()
                 .reset_index(name="count"))
 
     grid = _grid(cell)
@@ -304,7 +324,7 @@ elif view == "Density grid" and sub is not None:
         zoom = 6
     m = folium.Map(location=center, zoom_start=zoom, tiles="OpenStreetMap")
 
-    maxc = int(grid["count"].max())
+    maxc = max(1, int(round(grid["count"].max())))
     norm = colors.LogNorm(vmin=1, vmax=maxc)
     cmap = colormaps["YlOrRd"]
     radius_m = int(cell * 111320 * 0.6)
@@ -336,7 +356,7 @@ if sub is not None:
     monthly = sub.groupby(["year", "month"])["weight"].sum().reset_index(name="count")
     pivot = monthly.pivot(index="year", columns="month", values="count")
     pivot = pivot.reindex(columns=range(1, 13)).fillna(0)
-    pivot.columns = [calendar.month_abbr[m] for m in pivot.columns]
+    pivot.columns = [calendar.month_abbr[mo] for mo in pivot.columns]
 
     heat = px.imshow(
         pivot,
@@ -349,23 +369,54 @@ if sub is not None:
     heat.update_layout(height=max(250, 60 * len(pivot) + 120))
     st.plotly_chart(heat, use_container_width=True, key="calendar")
 
-    # Current (latest) month vs the historical median for that same month
-    latest = monthly.sort_values(["year", "month"]).iloc[-1]
-    ly, lm = int(latest["year"]), int(latest["month"])
-    current = float(latest["count"])
-    history = monthly[(monthly["month"] == lm) & (monthly["year"] < ly)]["count"]
+    # Harmonization check: yearly totals per sensor should join smoothly
+    with st.expander("Harmonization check — yearly totals by sensor"):
+        yearly = (
+            sub.groupby(["year", "sensor"])["weight"].sum()
+            .unstack(fill_value=0)
+        )
+        fig_y, ax_y = plt.subplots(figsize=(10, 3.5))
+        if "MODIS" in yearly:
+            ax_y.plot(yearly.index, yearly["MODIS"], color="tab:red",
+                      marker=".", markersize=3, label="MODIS (scaled)")
+        if "VIIRS" in yearly:
+            ax_y.plot(yearly.index, yearly["VIIRS"], color="tab:blue",
+                      marker=".", markersize=3, label="VIIRS")
+        ax_y.set_ylabel("detections / year")
+        ax_y.legend()
+        fig_y.tight_layout()
+        st.pyplot(fig_y)
+        plt.close(fig_y)
+        st.caption(
+            "If harmonization worked, the MODIS line (scaled) and VIIRS line "
+            "should meet smoothly around the sensor transition."
+        )
+
+    # Latest (possibly partial) month vs same day-range in past years
+    latest_date = sub["acq_date"].max()
+    ly, lm, last_day = latest_date.year, latest_date.month, latest_date.day
+
+    current = sub[(sub.year == ly) & (sub.month == lm)]["weight"].sum()
+
+    past_years = sorted(y for y in sub["year"].unique() if y < ly)
+    hist = (
+        sub[(sub.month == lm) & (sub.year < ly) & (sub.acq_date.dt.day <= last_day)]
+        .groupby("year")["weight"].sum()
+        .reindex(past_years, fill_value=0)
+    )
 
     c1, c2 = st.columns(2)
-    if len(history) > 0:
-        median = float(history.median())
+    label = f"{calendar.month_name[lm]} {ly} (days 1 to {last_day})"
+    if len(hist) > 0:
+        median = float(hist.median())
         c1.metric(
-            f"{calendar.month_name[lm]} {ly}",
+            label,
             f"{current:.0f} hotspots",
             delta=f"{current - median:+.0f} vs historical median ({median:.0f})",
             delta_color="inverse",  # more fire = worse = red
         )
     else:
-        c1.metric(f"{calendar.month_name[lm]} {ly}", f"{current:.0f} hotspots")
+        c1.metric(label, f"{current:.0f} hotspots")
         c2.info("Add more years of data to compare against the historical median.")
 
     # Sensor breakdown (useful to check harmonization)
